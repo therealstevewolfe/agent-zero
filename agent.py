@@ -8,7 +8,15 @@ import uuid
 import models
 
 from langchain_core.prompt_values import ChatPromptValue
-from python.helpers import extract_tools, rate_limiter, files, errors, history, tokens
+from python.helpers import (
+    extract_tools,
+    rate_limiter,
+    files,
+    errors,
+    history,
+    tokens,
+    openclaw_adapter,
+)
 from python.helpers.print_style import PrintStyle
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
@@ -624,12 +632,13 @@ class Agent:
 
     async def process_tools(self, msg: str):
         # search for tool usage requests in agent message
-        tool_request = extract_tools.json_parse_dirty(msg)
+        normalized_msg = openclaw_adapter.normalize_model_output(msg)
+        tool_request = openclaw_adapter.extract_tool_request(normalized_msg)
 
         if tool_request is not None:
             tool_name = tool_request.get("tool_name", "")
             tool_args = tool_request.get("tool_args", {})
-            tool = self.get_tool(tool_name, tool_args, msg)
+            tool = self.get_tool(tool_name, tool_args, normalized_msg)
 
             await self.handle_intervention()  # wait if paused and handle intervention message if needed
             await tool.before_execution(**tool_args)
@@ -640,6 +649,15 @@ class Agent:
             await self.handle_intervention()  # wait if paused and handle intervention message if needed
             if response.break_loop:
                 return response.message
+        elif openclaw_adapter.should_fallback_plain_response(normalized_msg):
+            # OpenAI-compatible endpoints may return plain assistant text instead of tool JSON.
+            # Treat it as a valid final response to avoid repeat-loop deadlocks.
+            self.context.log.log(
+                type="agent",
+                heading=f"{self.agent_name}: Plain-response fallback",
+                content=normalized_msg,
+            )
+            return normalized_msg
         else:
             msg = self.read_prompt("fw.msg_misformat.md")
             await self.hist_add_warning(msg)
