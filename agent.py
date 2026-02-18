@@ -16,6 +16,7 @@ from python.helpers import (
     history,
     tokens,
     openclaw_adapter,
+    superframe_events,
 )
 from python.helpers.print_style import PrintStyle
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -251,8 +252,14 @@ class Agent:
         self.last_user_message: history.Message | None = None
         self.intervention: UserMessage | None = None
         self.data = {}  # free data object all the tools can use
+        self._superframe_run_id: str | None = None
+        self._superframe_run_completed_emitted = True
 
     async def monologue(self):
+        self._superframe_run_id = str(uuid.uuid4())
+        self._superframe_run_completed_emitted = False
+        self.emit_superframe_event("run.started", {})
+
         while True:
             try:
                 # loop data dictionary to pass to extensions
@@ -317,6 +324,12 @@ class Agent:
                             # process tools requested in agent message
                             tools_result = await self.process_tools(agent_response)
                             if tools_result:  # final response of message loop available
+                                self.emit_run_completed_once(
+                                    {
+                                        "status": "succeeded",
+                                        "output_preview": tools_result[:500],
+                                    }
+                                )
                                 return tools_result  # break the execution if the task is done
 
                     # exceptions inside message loop:
@@ -387,6 +400,9 @@ class Agent:
             PrintStyle(font_color="white", background_color="red", padding=True).print(
                 f"Context {self.context.id} terminated during message loop"
             )
+            self.emit_run_completed_once(
+                {"status": "failed", "error": "cancelled", "error_type": "CancelledError"}
+            )
             raise HandledException(
                 exception
             )  # Re-raise the exception to cancel the loop
@@ -400,6 +416,13 @@ class Agent:
                 heading="Error",
                 content=error_message,
                 kvps={"text": error_text},
+            )
+            self.emit_run_completed_once(
+                {
+                    "status": "failed",
+                    "error": str(exception),
+                    "error_type": type(exception).__name__,
+                }
             )
             raise HandledException(exception)  # Re-raise the exception to kill the loop
 
@@ -442,6 +465,25 @@ class Agent:
 
     def set_data(self, field: str, value):
         self.data[field] = value
+
+    def emit_superframe_event(self, event: str, payload: dict[str, Any] | None = None):
+        emitter = superframe_events.get_superframe_event_emitter()
+        base_payload = {
+            "context_id": self.context.id,
+            "agent_number": self.number,
+            "agent_name": self.agent_name,
+        }
+        if self._superframe_run_id:
+            base_payload["run_id"] = self._superframe_run_id
+        if payload:
+            base_payload.update(payload)
+        emitter.emit(event, base_payload)
+
+    def emit_run_completed_once(self, payload: dict[str, Any]):
+        if self._superframe_run_completed_emitted:
+            return
+        self.emit_superframe_event("run.completed", payload)
+        self._superframe_run_completed_emitted = True
 
     def hist_add_message(self, ai: bool, content: history.MessageContent):
         return self.history.add_message(ai=ai, content=content)
@@ -640,13 +682,36 @@ class Agent:
             tool_args = tool_request.get("tool_args", {})
             tool = self.get_tool(tool_name, tool_args, normalized_msg)
 
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
-            await tool.before_execution(**tool_args)
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
-            response = await tool.execute(**tool_args)
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
-            await tool.after_execution(response)
-            await self.handle_intervention()  # wait if paused and handle intervention message if needed
+            self.emit_superframe_event(
+                "tool.call.requested", {"tool_name": tool_name, "tool_args": tool_args}
+            )
+
+            try:
+                await self.handle_intervention()  # wait if paused and handle intervention message if needed
+                await tool.before_execution(**tool_args)
+                await self.handle_intervention()  # wait if paused and handle intervention message if needed
+                response = await tool.execute(**tool_args)
+                await self.handle_intervention()  # wait if paused and handle intervention message if needed
+                await tool.after_execution(response)
+                await self.handle_intervention()  # wait if paused and handle intervention message if needed
+                self.emit_superframe_event(
+                    "tool.call.succeeded",
+                    {
+                        "tool_name": tool_name,
+                        "break_loop": bool(getattr(response, "break_loop", False)),
+                    },
+                )
+            except Exception as e:
+                self.emit_superframe_event(
+                    "tool.call.failed",
+                    {
+                        "tool_name": tool_name,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    },
+                )
+                raise
+
             if response.break_loop:
                 return response.message
         elif openclaw_adapter.should_fallback_plain_response(normalized_msg):
