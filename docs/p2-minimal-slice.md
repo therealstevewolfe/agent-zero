@@ -6,13 +6,17 @@ Status: additive and reversible
 ## Scope delivered
 1. Idempotency key utility proposal implemented as helper module + tests.
 2. Feature-flag wiring helper added with concrete env flags and safe defaults.
-3. Rollback wiring plan documented for staged enablement.
+3. Execution gate shadow wiring added to runtime path (decision telemetry + enforce hooks).
+4. Rollback wiring plan documented for staged enablement.
 
 ## Files
 - `python/helpers/idempotency.py`
 - `python/helpers/p2_flags.py`
+- `python/helpers/policy_gates.py`
 - `tests/p2/test_idempotency_and_flags.py`
+- `tests/p2/test_policy_gates.py`
 - `example.env` (flag examples)
+- `agent.py` (shadow gate + idempotency insertion hooks)
 
 ## Idempotency utility proposal
 Implemented deterministic key derivation:
@@ -23,7 +27,7 @@ Implemented deterministic key derivation:
 Key format:
 - `idem:v1:<sha256(...)>`
 
-This module is not yet wired into runtime tool execution; it is a safe drop-in scaffold for broker integration.
+This module is now minimally wired into runtime tool execution for mutating-tool calls (local-run dedupe), while remaining flag-gated and defaults-off.
 
 ## Feature flags (concrete)
 - `POLICY_GATES_V1` (`false` default)
@@ -50,7 +54,14 @@ This module is not yet wired into runtime tool execution; it is a safe drop-in s
    - Set policy to shadow/off: `POLICY_GATES_MODE=shadow` then `off`
    - Final hard rollback: all `*_V1=false`
 
+## Runtime wiring added (shadow-first)
+- `agent.py` now evaluates an execution policy gate per tool call when `POLICY_GATES_V1=true`.
+- In `POLICY_GATES_MODE=shadow`, decisions are emitted as telemetry only (`policy.gate.evaluated`) and execution continues.
+- In `POLICY_GATES_MODE=enforce` with `P2_SHADOW_EMIT_ONLY=false`, challenge/deny decisions can block execution.
+- Mutating tool calls derive an idempotency key when `IDEMPOTENCY_V1=true` and emit `idempotency.key.derived` telemetry.
+- Duplicate mutating calls are only blocked in enforce mode with shadow-emit disabled.
+
 ## Runtime safety notes
 - All flags default to non-enforcing/off behavior.
-- No existing execution path modified in this minimal slice.
-- Changes are reversible by removing helper module usage or setting flags off.
+- Changes are reversible by setting flags off.
+- Emission and gate checks are additive; default behavior remains unchanged.

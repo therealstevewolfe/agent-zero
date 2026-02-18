@@ -17,6 +17,9 @@ from python.helpers import (
     tokens,
     openclaw_adapter,
     superframe_events,
+    p2_flags,
+    policy_gates,
+    idempotency,
 )
 from python.helpers.print_style import PrintStyle
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -254,10 +257,14 @@ class Agent:
         self.data = {}  # free data object all the tools can use
         self._superframe_run_id: str | None = None
         self._superframe_run_completed_emitted = True
+        self._tool_invocation_counter = 0
+        self._idempotency_seen_keys: set[str] = set()
 
     async def monologue(self):
         self._superframe_run_id = str(uuid.uuid4())
         self._superframe_run_completed_emitted = False
+        self._tool_invocation_counter = 0
+        self._idempotency_seen_keys = set()
         self.emit_superframe_event("run.started", {})
 
         while True:
@@ -485,6 +492,28 @@ class Agent:
         self.emit_superframe_event("run.completed", payload)
         self._superframe_run_completed_emitted = True
 
+    def next_tool_invocation_id(self) -> str:
+        self._tool_invocation_counter += 1
+        run_id = self._superframe_run_id or self.context.id
+        return f"{run_id}:{self._tool_invocation_counter}"
+
+    def derive_local_idempotency_key(
+        self, tool_name: str, tool_args: dict[str, Any], invocation_id: str
+    ) -> str:
+        request = idempotency.IdempotencyInput(
+            root_session_id=self.context.id,
+            invocation_id=invocation_id,
+            operation_fingerprint={
+                "tool": tool_name,
+                "operation": "execute",
+                "target": tool_args.get("target")
+                or tool_args.get("url")
+                or tool_args.get("path"),
+            },
+            payload=tool_args,
+        )
+        return idempotency.derive_idempotency_key(request)
+
     def hist_add_message(self, ai: bool, content: history.MessageContent):
         return self.history.add_message(ai=ai, content=content)
 
@@ -680,10 +709,94 @@ class Agent:
         if tool_request is not None:
             tool_name = tool_request.get("tool_name", "")
             tool_args = tool_request.get("tool_args", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+
+            invocation_id = self.next_tool_invocation_id()
+            flags = p2_flags.load_p2_flags()
+
+            if flags.policy_gates_v1:
+                gate_decision = policy_gates.evaluate_execution_gate(
+                    flags=flags,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    run_id=self._superframe_run_id or self.context.id,
+                    root_session_id=self.context.id,
+                    invocation_id=invocation_id,
+                )
+                self.emit_superframe_event(
+                    gate_decision.event_type,
+                    gate_decision.to_payload(),
+                )
+
+                if (
+                    flags.policy_gates_mode == "enforce"
+                    and not flags.p2_shadow_emit_only
+                    and gate_decision.decision in {"deny", "challenge"}
+                ):
+                    blocked = (
+                        f"Policy gate blocked tool '{tool_name}' "
+                        f"({gate_decision.reason_code})."
+                    )
+                    await self.hist_add_warning(blocked)
+                    self.context.log.log(
+                        type="warning",
+                        heading=f"{self.agent_name}: Policy gate blocked tool",
+                        content=blocked,
+                        kvps=gate_decision.to_payload(),
+                    )
+                    return None
+
+            if flags.idempotency_v1 and policy_gates.is_mutating_tool(tool_name, tool_args):
+                idempotency_key = self.derive_local_idempotency_key(
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    invocation_id=invocation_id,
+                )
+                duplicate = idempotency_key in self._idempotency_seen_keys
+                if not duplicate:
+                    self._idempotency_seen_keys.add(idempotency_key)
+
+                self.emit_superframe_event(
+                    "idempotency.key.derived",
+                    {
+                        "invocation_id": invocation_id,
+                        "tool_name": tool_name,
+                        "idempotency_key": idempotency_key,
+                        "duplicate": duplicate,
+                    },
+                )
+
+                if (
+                    duplicate
+                    and flags.policy_gates_mode == "enforce"
+                    and not flags.p2_shadow_emit_only
+                ):
+                    blocked = (
+                        f"Idempotency gate blocked duplicate mutating tool '{tool_name}'."
+                    )
+                    await self.hist_add_warning(blocked)
+                    self.context.log.log(
+                        type="warning",
+                        heading=f"{self.agent_name}: Idempotency gate blocked tool",
+                        content=blocked,
+                        kvps={
+                            "invocation_id": invocation_id,
+                            "tool_name": tool_name,
+                            "idempotency_key": idempotency_key,
+                        },
+                    )
+                    return None
+
             tool = self.get_tool(tool_name, tool_args, normalized_msg)
 
             self.emit_superframe_event(
-                "tool.call.requested", {"tool_name": tool_name, "tool_args": tool_args}
+                "tool.call.requested",
+                {
+                    "tool_name": tool_name,
+                    "tool_args": tool_args,
+                    "invocation_id": invocation_id,
+                },
             )
 
             try:
@@ -698,6 +811,7 @@ class Agent:
                     "tool.call.succeeded",
                     {
                         "tool_name": tool_name,
+                        "invocation_id": invocation_id,
                         "break_loop": bool(getattr(response, "break_loop", False)),
                     },
                 )
@@ -706,6 +820,7 @@ class Agent:
                     "tool.call.failed",
                     {
                         "tool_name": tool_name,
+                        "invocation_id": invocation_id,
                         "error": str(e),
                         "error_type": type(e).__name__,
                     },
